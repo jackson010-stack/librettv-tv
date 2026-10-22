@@ -10,7 +10,12 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.zip.GZIPInputStream;
 
 /** Talks to the Mac CMS collectors of {@link Sources}. */
@@ -35,6 +40,20 @@ public final class Api {
         public String playFrom = "";
         public String sourceKey = "";
         public String sourceName = "";
+        /** The collector's own category of this title, e.g. 电影 / 动作片. */
+        public String typeName = "";
+        public int typeId = 0;
+        /** The group the category belongs to, as the collector reports it in {@code type_id_1}. */
+        public int parentTypeId = 0;
+    }
+
+    /** One entry of a collector's category tree. */
+    public static final class Category {
+        public int typeId;
+        public int typePid;
+        public String typeName = "";
+        /** The name of the parent category, empty for a top level one. */
+        public String parentName = "";
     }
 
     private Api() {
@@ -70,6 +89,150 @@ public final class Api {
             return fetchPage(s, "&wd=" + URLEncoder.encode(keyword, "UTF-8"), pg);
         } catch (Exception e) {
             return new Page();
+        }
+    }
+
+    /** Page {@code pg} of one category of the collector. */
+    public static Page categoryPage(Sources.Source s, int typeId, int pg) {
+        return fetchPage(s, "&t=" + typeId, pg);
+    }
+
+    /**
+     * The collector's category tree. Mac CMS answers {@code ?ac=list} with a {@code class} array
+     * whose entries carry {@code type_id}, {@code type_pid} and {@code type_name}; the top level
+     * ones have a parent of 0.
+     */
+    public static List<Category> classes(Sources.Source s) {
+        List<Category> out = new ArrayList<>();
+        HttpURLConnection conn = null;
+        try {
+            conn = (HttpURLConnection) new URL(s.api + "/api.php/provide/vod/?ac=list").openConnection();
+            conn.setConnectTimeout(TIMEOUT_MS);
+            conn.setReadTimeout(TIMEOUT_MS);
+            conn.setInstanceFollowRedirects(true);
+            conn.setRequestProperty("User-Agent", UA);
+            conn.setRequestProperty("Accept", "application/json, text/plain, */*");
+            conn.setRequestProperty("Referer", s.origin() + "/");
+            conn.setRequestProperty("Accept-Encoding", "gzip");
+            if (conn.getResponseCode() < 200 || conn.getResponseCode() >= 300) {
+                return out;
+            }
+            InputStream in = conn.getInputStream();
+            if ("gzip".equalsIgnoreCase(conn.getContentEncoding())) {
+                in = new GZIPInputStream(in);
+            }
+            JSONObject obj = new JSONObject(readAll(in));
+            JSONArray arr = obj.optJSONArray("class");
+            if (arr == null) {
+                return out;
+            }
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject it = arr.optJSONObject(i);
+                if (it == null) {
+                    continue;
+                }
+                Category c = new Category();
+                c.typeId = num(it.optString("type_id"), 0);
+                c.typePid = num(it.optString("type_pid"), 0);
+                c.typeName = it.optString("type_name");
+                if (!c.typeName.isEmpty() && c.typeId > 0) {
+                    out.add(c);
+                }
+            }
+            fillParentNames(out);
+        } catch (Exception e) {
+            // A collector that cannot be reached simply has no categories.
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
+        }
+        return out;
+    }
+
+    /** Gives every category the name of its parent, once the parents are known. */
+    private static void fillParentNames(List<Category> cats) {
+        for (Category c : cats) {
+            for (Category p : cats) {
+                if (c.typePid != 0 && c.typePid == p.typeId) {
+                    c.parentName = p.typeName;
+                    break;
+                }
+            }
+        }
+    }
+
+    /**
+     * Some collectors publish a flat category list: every entry looks like a top level one, yet
+     * their titles carry the leaf category in {@code type_id} and the group in {@code type_id_1}.
+     * Asking the collector for one title of every category is the only way to learn which leaves
+     * belong to which group, so the whole tree costs one request per category.
+     */
+    public static void resolveParents(Sources.Source s, List<Category> cats) {
+        ExecutorService es = Executors.newFixedThreadPool(4);
+        List<Future<Integer>> futures = new ArrayList<>();
+        for (final Category c : cats) {
+            futures.add(es.submit(() -> {
+                Page p = categoryPage(s, c.typeId, 1);
+                for (Movie m : p.items) {
+                    if (m.parentTypeId > 0 && m.parentTypeId != c.typeId) {
+                        return m.parentTypeId;
+                    }
+                }
+                return 0;
+            }));
+        }
+        es.shutdown();
+        for (int i = 0; i < cats.size() && i < futures.size(); i++) {
+            try {
+                int parent = futures.get(i).get();
+                if (parent > 0) {
+                    cats.get(i).typePid = parent;
+                }
+            } catch (Exception ignored) {
+                // A category the collector would not answer for stays a top level one.
+            }
+        }
+        fillParentNames(cats);
+    }
+
+    /** The parent of every category as JSON, so a flat collector is only probed once. */
+    public static String encodeTree(List<Category> cats) {
+        JSONArray arr = new JSONArray();
+        for (Category c : cats) {
+            JSONObject o = new JSONObject();
+            try {
+                o.put("id", c.typeId);
+                o.put("pid", c.typePid);
+                arr.put(o);
+            } catch (Exception ignored) {
+            }
+        }
+        return arr.toString();
+    }
+
+    /** Restores a tree that {@link #encodeTree} wrote. */
+    public static void applyTree(List<Category> cats, String json) {
+        if (json == null || json.isEmpty()) {
+            return;
+        }
+        try {
+            JSONArray arr = new JSONArray(json);
+            Map<Integer, Integer> pids = new HashMap<>();
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.optJSONObject(i);
+                if (o != null) {
+                    pids.put(o.optInt("id"), o.optInt("pid"));
+                }
+            }
+            for (Category c : cats) {
+                Integer pid = pids.get(c.typeId);
+                if (pid != null) {
+                    c.typePid = pid;
+                }
+            }
+            fillParentNames(cats);
+        } catch (Exception ignored) {
         }
     }
 
@@ -136,6 +299,9 @@ public final class Api {
                 m.playFrom = it.optString("vod_play_from");
                 m.sourceKey = s.key;
                 m.sourceName = s.name;
+                m.typeId = num(it.optString("type_id"), 0);
+                m.typeName = it.optString("type_name");
+                m.parentTypeId = num(it.optString("type_id_1"), 0);
                 if (!m.name.isEmpty()) {
                     out.add(m);
                 }

@@ -14,6 +14,7 @@ import android.view.inputmethod.InputMethodManager;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.ImageView;
+import android.widget.ProgressBar;
 import android.widget.TextView;
 
 import androidx.annotation.NonNull;
@@ -23,8 +24,10 @@ import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -33,22 +36,38 @@ public class MainActivity extends AppCompatActivity {
 
     private static final int MAX_RESULTS = 150;
     private static final int MAX_BROWSE = 600;
+    /** How many collectors are asked for their categories before giving up on auto detection. */
+    private static final int CATEGORY_PROBES = 8;
+
+    /** What the right hand panel shows. */
+    private enum Panel { SHELF, CATEGORIES, CATEGORY_VIDEOS, HISTORY }
+
+    private static final int BROWSE_SEARCH = 0;
+    private static final int BROWSE_CATEGORY = 1;
 
     private final ExecutorService pool = Executors.newFixedThreadPool(6);
     private final Handler main = new Handler(Looper.getMainLooper());
     private final LinkedHashMap<String, Api.Movie> found = new LinkedHashMap<>();
     private final LinkedHashMap<String, Api.Page> cache = new LinkedHashMap<>();
+    private final Map<String, List<Api.Category>> classCache = new HashMap<>();
+    private final Map<String, History.Entry> historyIndex = new HashMap<>();
+    private final List<String> resolvingSources = new ArrayList<>();
     private final List<Api.Movie> browsed = new ArrayList<>();
 
     private SourceAdapter sourceAdapter;
     private PosterAdapter posterAdapter;
+    private CategoryAdapter categoryAdapter;
+    private HistoryAdapter historyAdapter;
     private EditText search;
     private TextView status;
     private TextView sourceCount;
     private RecyclerView results;
+    private GridLayoutManager grid;
     private Button moreBtn;
+    private Button clearBtn;
     private String query = "";
     private int generation = 0;
+    private int categoryGeneration = 0;
     private boolean initialFocusDone = false;
     private boolean imeOpen = false;
     private boolean loadingMore = false;
@@ -59,6 +78,16 @@ public class MainActivity extends AppCompatActivity {
     private int browsePage = 1;
     private int browsePageCount = 1;
     private int browseTotal = 0;
+
+    private Panel panel = Panel.SHELF;
+    /** The collector whose categories are shown; also the one the last shelf came from. */
+    private Sources.Source categorySource;
+    /** The top level category whose sub categories are on screen, if any. */
+    private Api.Category categoryParent;
+    private Api.Category currentCategory;
+    private Sources.Source browseSource;
+    private String browseLabel = "";
+    private int browseType = BROWSE_SEARCH;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -71,6 +100,7 @@ public class MainActivity extends AppCompatActivity {
         sourceCount = findViewById(R.id.source_count);
         results = findViewById(R.id.results);
         moreBtn = findViewById(R.id.more_btn);
+        clearBtn = findViewById(R.id.clear_btn);
 
         sourceAdapter = new SourceAdapter(this, new SourceAdapter.OnToggle() {
             @Override
@@ -81,9 +111,17 @@ public class MainActivity extends AppCompatActivity {
         }, new SourceAdapter.OnSelect() {
             @Override
             public void onSelect(Sources.Source s) {
-                selected = s;
-                sourceAdapter.rebind();
-                runSearch(query);
+                selectSource(s);
+            }
+
+            @Override
+            public void onOpenHistory() {
+                openHistory();
+            }
+
+            @Override
+            public void onOpenCategories() {
+                openCategories();
             }
         });
         RecyclerView sourceList = findViewById(R.id.sources);
@@ -92,7 +130,9 @@ public class MainActivity extends AppCompatActivity {
         sourceAdapter.attach(sourceList);
 
         posterAdapter = new PosterAdapter(this);
-        GridLayoutManager grid = new GridLayoutManager(this, 3);
+        categoryAdapter = new CategoryAdapter(this);
+        historyAdapter = new HistoryAdapter(this);
+        grid = new GridLayoutManager(this, 3);
         results.setLayoutManager(grid);
         results.setAdapter(posterAdapter);
         results.post(() -> {
@@ -102,11 +142,13 @@ public class MainActivity extends AppCompatActivity {
 
         Button searchBtn = findViewById(R.id.search_btn);
         searchBtn.setOnClickListener(v -> {
+            openShelf();
             runSearch(search.getText().toString());
             hideIme();
         });
         search.setOnEditorActionListener((v, actionId, event) -> {
             if (actionId == EditorInfo.IME_ACTION_SEARCH) {
+                openShelf();
                 runSearch(search.getText().toString());
                 hideIme();
                 results.requestFocus();
@@ -150,6 +192,11 @@ public class MainActivity extends AppCompatActivity {
         });
 
         moreBtn.setOnClickListener(v -> loadMore());
+        clearBtn.setOnClickListener(v -> {
+            History.clear(this);
+            historyIndex.clear();
+            showHistory();
+        });
 
         Button allOn = findViewById(R.id.all_on);
         allOn.setOnClickListener(v -> {
@@ -175,12 +222,20 @@ public class MainActivity extends AppCompatActivity {
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        // The player may have filed a new position while we were away.
+        reloadHistory();
+    }
+
+    @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
         String q = intent.getStringExtra("q");
         if (q != null && !q.isEmpty()) {
             search.setText(q);
+            openShelf();
             runSearch(q);
         }
     }
@@ -201,9 +256,25 @@ public class MainActivity extends AppCompatActivity {
         search.setFocusableInTouchMode(false);
         results.setFocusable(true);
         results.setFocusableInTouchMode(true);
-        if (!results.requestFocus() && results.getChildCount() > 0) {
-            results.getChildAt(0).requestFocus();
+        results.requestFocus();
+        focusFirstCell(0);
+    }
+
+    /**
+     * A freshly filled grid has no cells yet, so the first one is grabbed once the layout ran.
+     */
+    private void focusFirstCell(int delayMs) {
+        RecyclerView.ViewHolder vh = results.findViewHolderForAdapterPosition(0);
+        if (vh != null) {
+            vh.itemView.requestFocus();
+            return;
         }
+        results.postDelayed(() -> {
+            RecyclerView.ViewHolder first = results.findViewHolderForAdapterPosition(0);
+            if (first != null) {
+                first.itemView.requestFocus();
+            }
+        }, delayMs);
     }
 
     /** Puts the D-pad on the collector list, always at its first row. */
@@ -223,7 +294,7 @@ public class MainActivity extends AppCompatActivity {
         }, 150);
     }
 
-    /** While paging a single collector, up from the grid should land on the load-more button. */
+    /** While paging, up from the grid should land on the load-more or clear button. */
     private void updateGridFocusTarget() {
         int up = gridUpTarget();
         results.setNextFocusUpId(up);
@@ -233,7 +304,13 @@ public class MainActivity extends AppCompatActivity {
     }
 
     int gridUpTarget() {
-        return moreBtn.getVisibility() == View.VISIBLE ? R.id.more_btn : R.id.search;
+        if (moreBtn.getVisibility() == View.VISIBLE) {
+            return R.id.more_btn;
+        }
+        if (clearBtn.getVisibility() == View.VISIBLE) {
+            return R.id.clear_btn;
+        }
+        return R.id.search;
     }
 
     private int dp(int px) {
@@ -262,6 +339,294 @@ public class MainActivity extends AppCompatActivity {
         sourceCount.setText("已启用 " + on + " / " + Sources.ALL.size() + " 个采集站");
     }
 
+    // ---------------------------------------------------------------- panels
+
+    /** Back to the merged or single source shelf. */
+    private void openShelf() {
+        panel = Panel.SHELF;
+        clearBtn.setVisibility(View.GONE);
+        results.setAdapter(posterAdapter);
+        sourceAdapter.rebind();
+    }
+
+    /** The right panel lists the titles that were watched. */
+    private void openHistory() {
+        panel = Panel.HISTORY;
+        moreBtn.setVisibility(View.GONE);
+        clearBtn.setVisibility(View.VISIBLE);
+        sourceAdapter.rebind();
+        showHistory();
+    }
+
+    private void showHistory() {
+        results.setAdapter(historyAdapter);
+        grid.setSpanCount(Math.max(3, results.getWidth() / dp(180)));
+        List<History.Entry> list = new ArrayList<>(historyIndex.values());
+        historyAdapter.setItems(list);
+        if (list.isEmpty()) {
+            status.setText("还没有播放记录，看完一部就会出现在这里");
+        } else {
+            status.setText("播放记录 " + list.size() + " 条 · 点一下接着看");
+        }
+        updateGridFocusTarget();
+        focusGrid();
+    }
+
+    private void reloadHistory() {
+        historyIndex.clear();
+        for (History.Entry e : History.list(this)) {
+            historyIndex.put(e.key, e);
+        }
+        if (panel == Panel.HISTORY) {
+            historyAdapter.setItems(new ArrayList<>(historyIndex.values()));
+        } else if (posterAdapter != null) {
+            posterAdapter.refreshBadges();
+        }
+    }
+
+    /** Starts the title again where it was left, straight from the history grid. */
+    private void resume(History.Entry e) {
+        if (e == null || e.episodeUrl == null || e.episodeUrl.isEmpty()) {
+            status.setText("这条记录没有播放地址");
+            return;
+        }
+        Sources.Source s = Sources.byKey(e.sourceKey);
+        Intent i = new Intent(this, PlayerActivity.class);
+        i.putExtra("url", e.episodeUrl);
+        i.putExtra("referer", e.referer.isEmpty()
+                ? (s == null ? "" : s.origin() + "/") : e.referer);
+        i.putExtra("resumePosition", e.finished ? 0L : e.positionMs);
+        i.putExtra("durationMs", e.durationMs);
+        i.putExtra("title", e.name);
+        i.putExtra("episodeName", e.episodeName);
+        i.putExtra("pic", e.pic);
+        i.putExtra("year", e.year);
+        i.putExtra("type", e.type);
+        i.putExtra("remarks", e.remarks);
+        i.putExtra("playUrl", e.playUrl);
+        i.putExtra("playFrom", e.playFrom);
+        i.putExtra("sourceKey", e.sourceKey);
+        i.putExtra("sourceName", e.sourceName);
+        i.putExtra("vodId", e.id);
+        i.putExtra("historyKey", e.key);
+        startActivity(i);
+    }
+
+    /** The right panel lists the categories of one collector. */
+    private void openCategories() {
+        panel = Panel.CATEGORIES;
+        categoryParent = null;
+        moreBtn.setVisibility(View.GONE);
+        clearBtn.setVisibility(View.GONE);
+        sourceAdapter.rebind();
+        loadCategories();
+    }
+
+    private void loadCategories() {
+        results.setAdapter(categoryAdapter);
+        categoryAdapter.setItems(new ArrayList<>());
+        grid.setSpanCount(Math.max(3, results.getWidth() / dp(180)));
+        if (categorySource != null) {
+            fetchCategories(categorySource);
+        } else {
+            detectCategories();
+        }
+    }
+
+    /** Asks the enabled collectors for their categories and keeps the first that answers. */
+    private void detectCategories() {
+        final int gen = ++categoryGeneration;
+        final List<Sources.Source> probes = new ArrayList<>();
+        for (Sources.Source s : Sources.ALL) {
+            if (Prefs.isEnabled(this, s) && probes.size() < CATEGORY_PROBES) {
+                probes.add(s);
+            }
+        }
+        if (probes.isEmpty()) {
+            status.setText("没有启用任何采集站");
+            return;
+        }
+        status.setText("正在找能用的分类…");
+        final int[] done = {0};
+        for (final Sources.Source s : probes) {
+            pool.execute(() -> {
+                List<Api.Category> cats = Api.classes(s);
+                main.post(() -> {
+                    if (gen != categoryGeneration) {
+                        return;
+                    }
+                    if (!cats.isEmpty()) {
+                        classCache.put(s.key, cats);
+                        showCategories(cats, s);
+                    } else {
+                        done[0]++;
+                        if (done[0] == probes.size()) {
+                            status.setText("没有读到分类，换一个采集站再试");
+                        }
+                    }
+                });
+            });
+        }
+    }
+
+    private void fetchCategories(Sources.Source s) {
+        final int gen = ++categoryGeneration;
+        List<Api.Category> cached = classCache.get(s.key);
+        if (cached != null) {
+            showCategories(cached, s);
+            return;
+        }
+        status.setText("正在读取 " + s.name + " 的分类…");
+        pool.execute(() -> {
+            List<Api.Category> cats = Api.classes(s);
+            main.post(() -> {
+                if (gen != categoryGeneration) {
+                    return;
+                }
+                if (cats.isEmpty()) {
+                    status.setText(s.name + " · 没读到分类（连不上或该站不提供分类）");
+                    return;
+                }
+                classCache.put(s.key, cats);
+                showCategories(cats, s);
+            });
+        });
+    }
+
+    private void showCategories(List<Api.Category> cats, Sources.Source s) {
+        categorySource = s;
+        categoryParent = null;
+        showCategoryList(topLevel(cats), s.name + " · 点一个分类");
+        resolveFlatTree(cats, s);
+    }
+
+    /**
+     * Collectors that publish a flat category list hide their groups; their titles only carry the
+     * leaf category, so the tree has to be worked out with one probe per category. The result is
+     * kept, the collector is only ever asked once.
+     */
+    private void resolveFlatTree(List<Api.Category> cats, Sources.Source s) {
+        if (cats.size() < 2 || resolvingSources.contains(s.key)) {
+            return;
+        }
+        for (Api.Category c : cats) {
+            if (c.typePid != 0) {
+                return;
+            }
+        }
+        String cached = Prefs.categoryTree(this, s.key);
+        if (cached != null) {
+            Api.applyTree(cats, cached);
+            showCategoryList(topLevel(cats), s.name + " · 点一个分类");
+            return;
+        }
+        resolvingSources.add(s.key);
+        status.setText("正在分析 " + s.name + " 的分类层级…");
+        pool.execute(() -> {
+            Api.resolveParents(s, cats);
+            Prefs.saveCategoryTree(MainActivity.this, s.key, Api.encodeTree(cats));
+            main.post(() -> {
+                resolvingSources.remove(s.key);
+                if (categorySource == s && panel == Panel.CATEGORIES) {
+                    showCategoryList(topLevel(cats), s.name + " · 点一个分类");
+                }
+            });
+        });
+    }
+
+    /** The collectors list their categories as a tree: the top level ones have no parent. */
+    private List<Api.Category> topLevel(List<Api.Category> cats) {
+        List<Api.Category> out = new ArrayList<>();
+        for (Api.Category c : cats) {
+            if (c.typePid == 0) {
+                out.add(c);
+            }
+        }
+        if (out.isEmpty()) {
+            return cats;
+        }
+        return out;
+    }
+
+    /** The sub categories of one top level category. */
+    private List<Api.Category> childrenOf(Api.Category parent) {
+        List<Api.Category> out = new ArrayList<>();
+        List<Api.Category> cats = categorySource == null ? null : classCache.get(categorySource.key);
+        if (cats == null) {
+            return out;
+        }
+        for (Api.Category c : cats) {
+            if (c.typePid == parent.typeId) {
+                out.add(c);
+            }
+        }
+        return out;
+    }
+
+    private void showCategoryList(List<Api.Category> cats, String hint) {
+        categoryAdapter.setItems(cats);
+        if (cats.isEmpty()) {
+            status.setText("这个分类下面没有子类");
+        } else {
+            status.setText(hint + " · " + cats.size() + " 项");
+        }
+        updateGridFocusTarget();
+        focusGrid();
+    }
+
+    /** Opens one category: a parent shows its sub categories, a leaf lists its titles. */
+    private void openCategory(Api.Category c) {
+        if (c == null || categorySource == null) {
+            status.setText("先选一个采集站再浏览它的分类");
+            return;
+        }
+        List<Api.Category> kids = childrenOf(c);
+        if (!kids.isEmpty()) {
+            categoryParent = c;
+            showCategoryList(kids, c.typeName + " · 子类");
+            return;
+        }
+        panel = Panel.CATEGORY_VIDEOS;
+        currentCategory = c;
+        browseSource = categorySource;
+        browseType = BROWSE_CATEGORY;
+        browseLabel = c.typeName + " · " + (categorySource == null ? "" : categorySource.name);
+        browsePage = 1;
+        browsePageCount = 1;
+        browseTotal = 0;
+        browsed.clear();
+        results.setAdapter(posterAdapter);
+        grid.setSpanCount(Math.max(3, results.getWidth() / dp(180)));
+        posterAdapter.setItems(new ArrayList<>());
+        moreBtn.setVisibility(View.GONE);
+        clearBtn.setVisibility(View.GONE);
+        updateGridFocusTarget();
+
+        final int gen = ++generation;
+        status.setText("正在读取 " + c.typeName + "…");
+        pool.execute(() -> {
+            Api.Page p = Api.categoryPage(categorySource, c.typeId, 1);
+            main.post(() -> {
+                if (gen != generation) {
+                    return;
+                }
+                applyPage(p, true);
+            });
+        });
+    }
+
+    /** Picks a collector: the shelf shows its contents and its categories become the default. */
+    private void selectSource(Sources.Source s) {
+        selected = s;
+        if (s != null) {
+            categorySource = s;
+        }
+        openShelf();
+        runSearch(query);
+    }
+
+    // ---------------------------------------------------------------- shelf
+
     private void runSearch(String q) {
         String next = q == null ? "" : q.trim();
         query = next;
@@ -278,6 +643,7 @@ public class MainActivity extends AppCompatActivity {
         found.clear();
         posterAdapter.setItems(new ArrayList<>());
         moreBtn.setVisibility(View.GONE);
+        clearBtn.setVisibility(View.GONE);
         updateGridFocusTarget();
 
         final List<Sources.Source> active = new ArrayList<>();
@@ -337,6 +703,9 @@ public class MainActivity extends AppCompatActivity {
         browsePage = 1;
         browsePageCount = 1;
         browseTotal = 0;
+        browseSource = s;
+        browseType = BROWSE_SEARCH;
+        browseLabel = s.name;
         posterAdapter.setItems(new ArrayList<>());
         moreBtn.setVisibility(View.GONE);
         moreBtn.setEnabled(true);
@@ -355,7 +724,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void loadMore() {
-        final Sources.Source s = selected;
+        final Sources.Source s = browseSource;
         if (s == null || loadingMore) {
             return;
         }
@@ -367,10 +736,15 @@ public class MainActivity extends AppCompatActivity {
         final int gen = generation;
         // The button stays enabled so it keeps the D-pad focus while the page loads.
         loadingMore = true;
-        status.setText("正在读取 " + s.name + " 第 " + next + " 页…");
+        status.setText("正在读取 " + browseLabel + " 第 " + next + " 页…");
 
         pool.execute(() -> {
-            Api.Page p = q.isEmpty() ? Api.catalogue(s, next) : Api.searchPage(s, q, next);
+            Api.Page p;
+            if (browseType == BROWSE_CATEGORY) {
+                p = Api.categoryPage(s, currentCategory.typeId, next);
+            } else {
+                p = q.isEmpty() ? Api.catalogue(s, next) : Api.searchPage(s, q, next);
+            }
             main.post(() -> {
                 if (gen != generation) {
                     return;
@@ -385,7 +759,7 @@ public class MainActivity extends AppCompatActivity {
         if (p.failed) {
             moreBtn.setVisibility(View.GONE);
             updateGridFocusTarget();
-            status.setText(selected.name + " · 连不上（网络被阻断或站点已下线）");
+            status.setText(browseLabel + " · 连不上（网络被阻断或站点已下线）");
             return;
         }
         if (replace) {
@@ -402,14 +776,14 @@ public class MainActivity extends AppCompatActivity {
         browseTotal = p.total;
         posterAdapter.setItems(new ArrayList<>(browsed));
 
-        StringBuilder sb = new StringBuilder(selected.name);
+        StringBuilder sb = new StringBuilder(browseLabel);
         sb.append(" · 已显示 ").append(browsed.size()).append(" 条");
         if (browseTotal > 0) {
             sb.append(" · 共 ").append(browseTotal).append(" 条");
         }
         sb.append(" · 第 ").append(browsePage).append("/").append(browsePageCount).append(" 页");
         if (browsed.isEmpty()) {
-            sb.append(" · 该源没有内容");
+            sb.append(browseType == BROWSE_CATEGORY ? " · 该分类没有内容" : " · 该源没有内容");
         }
         status.setText(sb.toString());
 
@@ -473,6 +847,39 @@ public class MainActivity extends AppCompatActivity {
     }
 
     @Override
+    public void onBackPressed() {
+        if (panel == Panel.CATEGORY_VIDEOS) {
+            if (categoryParent != null) {
+                panel = Panel.CATEGORIES;
+                Api.Category parent = categoryParent;
+                showCategoryList(childrenOf(parent), parent.typeName + " · 子类");
+                return;
+            }
+            openCategories();
+            return;
+        }
+        if (panel == Panel.CATEGORIES) {
+            if (categoryParent != null) {
+                categoryParent = null;
+                List<Api.Category> cats = categorySource == null
+                        ? null : classCache.get(categorySource.key);
+                showCategoryList(topLevel(cats == null ? new ArrayList<>() : cats),
+                        categorySource == null ? "分类" : categorySource.name + " · 点一个分类");
+                return;
+            }
+            openShelf();
+            runSearch(query);
+            return;
+        }
+        if (panel == Panel.HISTORY) {
+            openShelf();
+            runSearch(query);
+            return;
+        }
+        super.onBackPressed();
+    }
+
+    @Override
     protected void onDestroy() {
         super.onDestroy();
         pool.shutdownNow();
@@ -489,12 +896,20 @@ public class MainActivity extends AppCompatActivity {
 
         interface OnSelect {
             void onSelect(Sources.Source s);
+
+            void onOpenHistory();
+
+            void onOpenCategories();
         }
 
         private static final int TYPE_SOURCE = 0;
         private static final int TYPE_HEADER = 1;
         private static final int TYPE_ALL = 2;
+        private static final int TYPE_HISTORY = 3;
+        private static final int TYPE_CATEGORY = 4;
         private static final Object ALL_ROW = new Object();
+        private static final Object HISTORY_ROW = new Object();
+        private static final Object CATEGORY_ROW = new Object();
 
         private final MainActivity host;
         private final OnToggle onToggle;
@@ -515,6 +930,8 @@ public class MainActivity extends AppCompatActivity {
 
         private void build() {
             items.clear();
+            items.add(HISTORY_ROW);
+            items.add(CATEGORY_ROW);
             items.add(ALL_ROW);
             items.addAll(Sources.NORMAL);
             if (!Sources.ADULT.isEmpty()) {
@@ -552,6 +969,12 @@ public class MainActivity extends AppCompatActivity {
             if (item == ALL_ROW) {
                 return TYPE_ALL;
             }
+            if (item == HISTORY_ROW) {
+                return TYPE_HISTORY;
+            }
+            if (item == CATEGORY_ROW) {
+                return TYPE_CATEGORY;
+            }
             return item instanceof String ? TYPE_HEADER : TYPE_SOURCE;
         }
 
@@ -576,6 +999,32 @@ public class MainActivity extends AppCompatActivity {
                 vh.itemView.setOnClickListener(null);
                 return;
             }
+            if (item == HISTORY_ROW) {
+                vh.name.setText("继续观看");
+                vh.mark.setText("▶");
+                vh.mark.setTextColor(host.getColor(R.color.accent));
+                vh.state.setVisibility(View.GONE);
+                vh.state.setOnClickListener(null);
+                vh.itemView.setNextFocusRightId(View.NO_ID);
+                boolean active = host.panel == Panel.HISTORY;
+                vh.itemView.setBackgroundResource(active ? R.drawable.bg_source_sel : R.drawable.bg_source);
+                vh.name.setTextColor(host.getColor(active ? R.color.accent : R.color.text));
+                vh.itemView.setOnClickListener(v -> onSelect.onOpenHistory());
+                return;
+            }
+            if (item == CATEGORY_ROW) {
+                vh.name.setText("影视分类");
+                vh.mark.setText("▦");
+                vh.mark.setTextColor(host.getColor(R.color.accent));
+                vh.state.setVisibility(View.GONE);
+                vh.state.setOnClickListener(null);
+                vh.itemView.setNextFocusRightId(View.NO_ID);
+                boolean active = host.panel == Panel.CATEGORIES || host.panel == Panel.CATEGORY_VIDEOS;
+                vh.itemView.setBackgroundResource(active ? R.drawable.bg_source_sel : R.drawable.bg_source);
+                vh.name.setTextColor(host.getColor(active ? R.color.accent : R.color.text));
+                vh.itemView.setOnClickListener(v -> onSelect.onOpenCategories());
+                return;
+            }
             if (item == ALL_ROW) {
                 vh.name.setText("全部采集站（合并）");
                 vh.mark.setText("全");
@@ -583,9 +1032,10 @@ public class MainActivity extends AppCompatActivity {
                 vh.state.setVisibility(View.GONE);
                 vh.state.setOnClickListener(null);
                 vh.itemView.setNextFocusRightId(View.NO_ID);
+                boolean active = host.panel == Panel.SHELF && host.selected == null;
                 vh.itemView.setBackgroundResource(
-                        host.selected == null ? R.drawable.bg_source_sel : R.drawable.bg_source);
-                vh.name.setTextColor(host.getColor(host.selected == null ? R.color.accent : R.color.text));
+                        active ? R.drawable.bg_source_sel : R.drawable.bg_source);
+                vh.name.setTextColor(host.getColor(active ? R.color.accent : R.color.text));
                 vh.itemView.setOnClickListener(v -> onSelect.onSelect(null));
                 return;
             }
@@ -599,7 +1049,7 @@ public class MainActivity extends AppCompatActivity {
             vh.state.setText(on ? "开" : "关");
             vh.itemView.setNextFocusRightId(R.id.state);
 
-            boolean sel = host.selected == s;
+            boolean sel = host.panel == Panel.SHELF && host.selected == s;
             vh.name.setTextColor(host.getColor(sel ? R.color.accent : R.color.text));
             vh.itemView.setBackgroundResource(sel ? R.drawable.bg_source_sel : R.drawable.bg_source);
 
@@ -637,6 +1087,7 @@ public class MainActivity extends AppCompatActivity {
     static class PosterAdapter extends RecyclerView.Adapter<PosterAdapter.VH> {
         private final MainActivity host;
         private List<Api.Movie> items = new ArrayList<>();
+        private RecyclerView grid;
 
         PosterAdapter(MainActivity host) {
             this.host = host;
@@ -647,9 +1098,41 @@ public class MainActivity extends AppCompatActivity {
             notifyDataSetChanged();
         }
 
+        /**
+         * Redraws the cards so a freshly filed position shows up on the badge. Only the visible
+         * cards are rebound: a full notifyDataSetChanged would drop the D-pad focus.
+         */
+        void refreshBadges() {
+            if (grid == null) {
+                return;
+            }
+            for (int i = 0; i < grid.getChildCount(); i++) {
+                View child = grid.getChildAt(i);
+                int pos = grid.getChildAdapterPosition(child);
+                RecyclerView.ViewHolder vh = grid.getChildViewHolder(child);
+                if (pos == RecyclerView.NO_POSITION || !(vh instanceof VH)) {
+                    continue;
+                }
+                bindBadge((VH) vh, items.get(pos));
+            }
+        }
+
+        private void bindBadge(VH holder, Api.Movie m) {
+            History.Entry seen = host.historyIndex.get(History.keyOf(m.sourceKey, m.id));
+            if (seen != null) {
+                holder.badge.setVisibility(View.VISIBLE);
+                holder.badge.setText(seen.finished ? "▶ 重看" : "▶ 续播");
+            } else {
+                holder.badge.setVisibility(View.GONE);
+            }
+        }
+
         @NonNull
         @Override
         public VH onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
+            if (parent instanceof RecyclerView) {
+                grid = (RecyclerView) parent;
+            }
             return new VH(LayoutInflater.from(parent.getContext()).inflate(R.layout.item_poster, parent, false));
         }
 
@@ -674,6 +1157,7 @@ public class MainActivity extends AppCompatActivity {
             holder.subtitle.setText(sub.toString());
             Sources.Source s = Sources.byKey(m.sourceKey);
             ImageLoader.load(holder.poster, m.pic, s == null ? null : s.origin() + "/");
+            bindBadge(holder, m);
             holder.itemView.setOnClickListener(v -> host.openDetail(m));
             holder.itemView.setNextFocusUpId(host.gridUpTarget());
             // The geometric focus search picks an arbitrary row of the collector list, so the
@@ -696,12 +1180,153 @@ public class MainActivity extends AppCompatActivity {
             final ImageView poster;
             final TextView title;
             final TextView subtitle;
+            final TextView badge;
 
             VH(View v) {
                 super(v);
                 poster = v.findViewById(R.id.poster);
                 title = v.findViewById(R.id.title);
                 subtitle = v.findViewById(R.id.subtitle);
+                badge = v.findViewById(R.id.badge);
+            }
+        }
+    }
+
+    /** The category grid. */
+    static class CategoryAdapter extends RecyclerView.Adapter<CategoryAdapter.VH> {
+        private final MainActivity host;
+        private List<Api.Category> items = new ArrayList<>();
+
+        CategoryAdapter(MainActivity host) {
+            this.host = host;
+        }
+
+        void setItems(List<Api.Category> items) {
+            this.items = items;
+            notifyDataSetChanged();
+        }
+
+        @NonNull
+        @Override
+        public VH onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
+            return new VH(LayoutInflater.from(parent.getContext()).inflate(R.layout.item_category, parent, false));
+        }
+
+        @Override
+        public void onBindViewHolder(@NonNull VH holder, int position) {
+            Api.Category c = items.get(position);
+            holder.name.setText(c.typeName);
+            int kids = host.childrenOf(c).size();
+            if (kids > 0) {
+                holder.parent.setText(kids + " 个子类");
+            } else if (c.parentName.isEmpty()) {
+                holder.parent.setText("分类");
+            } else {
+                holder.parent.setText(c.parentName + " · 子类");
+            }
+            holder.itemView.setOnClickListener(v -> host.openCategory(c));
+            holder.itemView.setNextFocusUpId(host.gridUpTarget());
+            holder.itemView.setOnKeyListener((v, keyCode, event) -> {
+                if (event.getAction() == KeyEvent.ACTION_DOWN && keyCode == KeyEvent.KEYCODE_DPAD_LEFT) {
+                    host.focusSourceList();
+                    return true;
+                }
+                return false;
+            });
+        }
+
+        @Override
+        public int getItemCount() {
+            return items.size();
+        }
+
+        static class VH extends RecyclerView.ViewHolder {
+            final TextView name;
+            final TextView parent;
+
+            VH(View v) {
+                super(v);
+                name = v.findViewById(R.id.cat_name);
+                parent = v.findViewById(R.id.cat_parent);
+            }
+        }
+    }
+
+    /** The titles that were watched, with how far they got. */
+    static class HistoryAdapter extends RecyclerView.Adapter<HistoryAdapter.VH> {
+        private final MainActivity host;
+        private List<History.Entry> items = new ArrayList<>();
+
+        HistoryAdapter(MainActivity host) {
+            this.host = host;
+        }
+
+        void setItems(List<History.Entry> items) {
+            this.items = items;
+            notifyDataSetChanged();
+        }
+
+        @NonNull
+        @Override
+        public VH onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
+            return new VH(LayoutInflater.from(parent.getContext()).inflate(R.layout.item_history, parent, false));
+        }
+
+        @Override
+        public void onBindViewHolder(@NonNull VH holder, int position) {
+            History.Entry e = items.get(position);
+            holder.title.setText(e.name);
+            StringBuilder sub = new StringBuilder();
+            if (!e.episodeName.isEmpty()) {
+                sub.append(e.episodeName);
+            }
+            if (e.sourceName != null && !e.sourceName.isEmpty()) {
+                if (sub.length() > 0) {
+                    sub.append(" · ");
+                }
+                sub.append(e.sourceName);
+            }
+            holder.subtitle.setText(sub.toString());
+            if (e.finished) {
+                holder.progress.setProgress(100);
+                holder.time.setText("已看完 · 重新观看");
+            } else {
+                holder.progress.setProgress(e.progressPercent());
+                holder.time.setText(History.formatMs(e.positionMs)
+                        + (e.durationMs > 0 ? " / " + History.formatMs(e.durationMs) : ""));
+            }
+            Sources.Source s = Sources.byKey(e.sourceKey);
+            ImageLoader.load(holder.poster, e.pic, s == null ? null : s.origin() + "/");
+            holder.itemView.setOnClickListener(v -> host.resume(e));
+            holder.itemView.setNextFocusUpId(host.gridUpTarget());
+            holder.itemView.setOnKeyListener((v, keyCode, event) -> {
+                if (event.getAction() == KeyEvent.ACTION_DOWN && keyCode == KeyEvent.KEYCODE_DPAD_LEFT) {
+                    host.focusSourceList();
+                    return true;
+                }
+                return false;
+            });
+        }
+
+        @Override
+        public int getItemCount() {
+            return items.size();
+        }
+
+        static class VH extends RecyclerView.ViewHolder {
+            final ImageView poster;
+            final TextView title;
+            final TextView subtitle;
+            final TextView time;
+            final ProgressBar progress;
+
+            VH(View v) {
+                super(v);
+                poster = v.findViewById(R.id.poster);
+                title = v.findViewById(R.id.title);
+                subtitle = v.findViewById(R.id.subtitle);
+                time = v.findViewById(R.id.time);
+                progress = v.findViewById(R.id.progress);
             }
         }
     }

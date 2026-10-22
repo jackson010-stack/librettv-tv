@@ -22,8 +22,32 @@ import java.util.Collections;
 /** Full-screen playback through Media3, so no WebView is involved. */
 public class PlayerActivity extends AppCompatActivity {
 
+    private static final long SAVE_EVERY_MS = 5000;
+
     private ExoPlayer player;
     private final Handler main = new Handler(Looper.getMainLooper());
+
+    /** The title this playback belongs to, used to file the position under. */
+    private String historyKey = "";
+    private String sourceKey = "";
+    private String sourceName = "";
+    private String vodId = "";
+    private String title = "";
+    private String pic = "";
+    private String year = "";
+    private String type = "";
+    private String remarks = "";
+    private String playUrl = "";
+    private String playFrom = "";
+    private String episodeName = "";
+    /** The address the episode was started from, so it can be played again later. */
+    private String episodeUrl = "";
+    private String referer = "";
+
+    private long resumePosition;
+    private long knownDuration;
+    private boolean seeked;
+    private boolean recorded;
 
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
@@ -32,8 +56,26 @@ public class PlayerActivity extends AppCompatActivity {
 
         final String url = getIntent().getStringExtra("url");
         final String referer = getIntent().getStringExtra("referer");
+        this.episodeUrl = url == null ? "" : url;
+        this.referer = referer == null ? "" : referer;
         final TextView error = findViewById(R.id.error);
+        final TextView overlay = findViewById(R.id.overlay);
         PlayerView view = findViewById(R.id.player);
+
+        historyKey = extra("historyKey");
+        sourceKey = extra("sourceKey");
+        sourceName = extra("sourceName");
+        vodId = extra("vodId");
+        title = extra("title");
+        pic = extra("pic");
+        year = extra("year");
+        type = extra("type");
+        remarks = extra("remarks");
+        playUrl = extra("playUrl");
+        playFrom = extra("playFrom");
+        episodeName = extra("episodeName");
+        resumePosition = getIntent().getLongExtra("resumePosition", 0L);
+        knownDuration = getIntent().getLongExtra("durationMs", 0L);
 
         player = new ExoPlayer.Builder(this).build();
         view.setPlayer(player);
@@ -42,6 +84,20 @@ public class PlayerActivity extends AppCompatActivity {
             public void onPlayerError(PlaybackException e) {
                 error.setVisibility(View.VISIBLE);
                 error.setText(friendlyError(e));
+            }
+
+            @Override
+            public void onPlaybackStateChanged(int state) {
+                if (state == Player.STATE_READY) {
+                    if (!seeked && resumePosition > 0) {
+                        seeked = true;
+                        player.seekTo(resumePosition);
+                        showOverlay(overlay, "从 " + History.formatMs(resumePosition) + " 继续播放");
+                    }
+                    scheduleSave();
+                } else if (state == Player.STATE_ENDED) {
+                    saveProgress(true);
+                }
             }
         });
 
@@ -80,12 +136,90 @@ public class PlayerActivity extends AppCompatActivity {
         }).start();
     }
 
+    private String extra(String key) {
+        String v = getIntent().getStringExtra(key);
+        return v == null ? "" : v;
+    }
+
+    /** Shows a short hint about what is playing and disappears again. */
+    private void showOverlay(TextView overlay, String text) {
+        if (text == null || text.isEmpty()) {
+            return;
+        }
+        overlay.setText(text);
+        overlay.setVisibility(View.VISIBLE);
+        overlay.animate().alpha(1f).setDuration(200).start();
+        main.postDelayed(() -> overlay.animate().alpha(0f).setDuration(600).withEndAction(
+                () -> overlay.setVisibility(View.GONE)).start(), 3200);
+    }
+
     private void start(DefaultHttpDataSource.Factory http, String mediaUrl) {
         MediaSource mediaSource = new DefaultMediaSourceFactory(http)
                 .createMediaSource(MediaItem.fromUri(mediaUrl));
         player.setMediaSource(mediaSource);
         player.prepare();
         player.play();
+    }
+
+    private void scheduleSave() {
+        main.removeCallbacks(saveTask);
+        main.postDelayed(saveTask, SAVE_EVERY_MS);
+    }
+
+    private final Runnable saveTask = new Runnable() {
+        @Override
+        public void run() {
+            saveProgress(false);
+            if (player != null && player.isPlaying()) {
+                scheduleSave();
+            }
+        }
+    };
+
+    /**
+     * Files how far the title was watched. {@code ended} means the last episode ran to its end,
+     * so the title is offered as a fresh start instead of a resume.
+     */
+    private void saveProgress(boolean ended) {
+        if (player == null || historyKey.isEmpty() || recorded && ended) {
+            return;
+        }
+        long pos = player.getCurrentPosition();
+        long dur = player.getDuration();
+        if (dur <= 0) {
+            dur = knownDuration;
+        }
+        if (ended) {
+            pos = 0;
+        }
+        if (!ended && !History.worthKeeping(pos)) {
+            // Barely started: there is nothing to come back to.
+            History.remove(this, historyKey);
+            recorded = true;
+            return;
+        }
+        History.Entry e = new History.Entry();
+        e.key = historyKey;
+        e.sourceKey = sourceKey;
+        e.sourceName = sourceName;
+        e.id = vodId;
+        e.name = title;
+        e.pic = pic;
+        e.year = year;
+        e.type = type;
+        e.remarks = remarks;
+        e.playUrl = playUrl;
+        e.playFrom = playFrom;
+        e.episodeName = episodeName;
+        e.episodeUrl = episodeUrl;
+        e.referer = referer;
+        e.positionMs = pos;
+        e.durationMs = dur;
+        e.finished = ended;
+        History.record(this, e);
+        if (ended) {
+            recorded = true;
+        }
     }
 
     private String friendlyError(PlaybackException e) {
@@ -106,6 +240,15 @@ public class PlayerActivity extends AppCompatActivity {
     }
 
     @Override
+    protected void onPause() {
+        super.onPause();
+        if (player != null) {
+            player.pause();
+        }
+        saveProgress(false);
+    }
+
+    @Override
     protected void onStop() {
         super.onStop();
         if (player != null) {
@@ -116,6 +259,7 @@ public class PlayerActivity extends AppCompatActivity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        main.removeCallbacks(saveTask);
         if (player != null) {
             player.release();
             player = null;
@@ -124,6 +268,7 @@ public class PlayerActivity extends AppCompatActivity {
 
     @Override
     public void onBackPressed() {
+        saveProgress(false);
         if (player != null) {
             player.stop();
         }

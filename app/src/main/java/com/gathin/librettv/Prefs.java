@@ -11,6 +11,7 @@ public final class Prefs {
 
     private static final String FILE = "librettv";
     private static final String KEY_ENABLED = "enabled_sources";
+    private static final String KEY_TREE = "category_tree_";
 
     private Prefs() {
     }
@@ -54,5 +55,14 @@ public final class Prefs {
             }
         }
         prefs(c).edit().putStringSet(KEY_ENABLED, set).apply();
+    }
+
+    /** The category tree of a collector, once its groups have been worked out. */
+    public static String categoryTree(Context c, String sourceKey) {
+        return prefs(c).getString(KEY_TREE + sourceKey, null);
+    }
+
+    public static void saveCategoryTree(Context c, String sourceKey, String json) {
+        prefs(c).edit().putString(KEY_TREE + sourceKey, json).apply();
     }
 }

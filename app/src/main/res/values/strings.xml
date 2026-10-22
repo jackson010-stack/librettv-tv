@@ -8,6 +8,10 @@
     <string name="sources_all_off">全部关闭</string>
     <string name="source_hint">点名称＝只看该源 · 点「开/关」＝启用停用</string>
     <string name="load_more">更多</string>
+    <string name="clear_history">清空记录</string>
+    <string name="continue_watching">继续观看</string>
+    <string name="categories">影视分类</string>
+    <string name="badge_resume">▶ 续播</string>
     <string name="episodes">剧集</string>
     <string name="play">播放</string>
     <string name="loading">正在加载…</string>
