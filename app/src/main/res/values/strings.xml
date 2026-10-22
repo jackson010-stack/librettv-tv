@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">LibreTV</string>
+    <string name="search_hint">输入片名，例如：庆余年</string>
+    <string name="search">搜索</string>
+    <string name="sources">采集源</string>
+    <string name="sources_all_on">全部启用</string>
+    <string name="sources_all_off">全部关闭</string>
+    <string name="source_hint">点名称＝只看该源 · 点「开/关」＝启用停用</string>
+    <string name="load_more">更多</string>
+    <string name="episodes">剧集</string>
+    <string name="play">播放</string>
+    <string name="loading">正在加载…</string>
+    <string name="empty">没有结果，换个片名或启用更多源</string>
+    <string name="back">返回</string>
+</resources>

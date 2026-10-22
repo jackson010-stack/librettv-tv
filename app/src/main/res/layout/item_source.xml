@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="46dp"
+    android:orientation="horizontal"
+    android:background="@drawable/bg_source"
+    android:focusable="true"
+    android:focusableInTouchMode="false"
+    android:nextFocusRight="@+id/state"
+    android:gravity="center_vertical"
+    android:paddingStart="12dp"
+    android:paddingEnd="6dp"
+    android:layout_marginBottom="6dp">
+
+    <TextView
+        android:id="@+id/mark"
+        android:layout_width="24dp"
+        android:layout_height="wrap_content"
+        android:textSize="14sp"
+        android:textStyle="bold"
+        android:textColor="@color/ok" />
+
+    <TextView
+        android:id="@+id/name"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:layout_marginStart="8dp"
+        android:textColor="@color/text"
+        android:textSize="14sp"
+        android:maxLines="1"
+        android:ellipsize="end" />
+
+    <TextView
+        android:id="@+id/state"
+        android:layout_width="wrap_content"
+        android:layout_height="match_parent"
+        android:gravity="center"
+        android:minWidth="34dp"
+        android:paddingStart="8dp"
+        android:paddingEnd="8dp"
+        android:textColor="@color/text_dim"
+        android:textSize="11sp"
+        android:maxLines="1"
+        android:focusable="true"
+        android:focusableInTouchMode="false"
+        android:background="@drawable/bg_toggle"
+        android:nextFocusRight="@+id/results" />
+</LinearLayout>
