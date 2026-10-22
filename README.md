@@ -66,9 +66,13 @@ export ANDROID_HOME=/opt/homebrew/share/android-commandlinetools
 # 本仓库以纯文本分发，gradle-wrapper.jar 需要先还原一次
 bash tools/restore-wrapper.sh
 
-./gradlew assembleDebug
+bash gradlew assembleDebug
 # 产物：app/build/outputs/apk/debug/app-debug.apk
 ```
+
+> 仓库里的脚本没有可执行位（发布渠道只保留文件内容，不保留权限），
+> 所以一律用 `bash gradlew`、`bash tools/restore-wrapper.sh` 调用；
+> 想直接 `./gradlew` 的话，先 `chmod +x gradlew tools/restore-wrapper.sh`。
 
 `tools/restore-wrapper.sh` 会把仓库里的 `gradle/wrapper/gradle-wrapper.jar.b64` 解码回真正的
 `gradle-wrapper.jar`（GitHub 连接器只能写文本，二进制文件没法直接提交，所以用 base64 存了一份）。
