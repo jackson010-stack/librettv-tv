@@ -1,0 +1,17 @@
+# Gradle / Android
+.gradle/
+build/
+local.properties
+*.apk
+*.aab
+*.iml
+.idea/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# 仓库里以 base64 存了一份 wrapper jar，还原出来的那个不重复提交
+gradle/wrapper/gradle-wrapper.jar
+
+# macOS
+.DS_Store
